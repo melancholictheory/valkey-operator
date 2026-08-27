@@ -154,7 +154,7 @@ type ValkeyNodeReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="apps",resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -463,6 +463,9 @@ func (r *ValkeyNodeReconciler) ensureStatefulSet(ctx context.Context, node *valk
 	// last-applied annotation (that can hide real STS edits).
 	if !podTemplateWouldRoll(sts.Spec.Template, desired.Spec.Template) {
 		if err := r.syncStatefulSetWithoutRoll(ctx, node, sts, desired); err != nil {
+			return err
+		}
+		if err := r.replaceSupersededPod(ctx, node, sts); err != nil {
 			return err
 		}
 		return r.clearWorkloadRollPending(ctx, node)
@@ -822,13 +825,7 @@ func (r *ValkeyNodeReconciler) updateStatus(ctx context.Context, node *valkeyiov
 		current.Status.PodName = pod.Name
 		current.Status.PodIP = pod.Status.PodIP
 
-		podReady := false
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				podReady = true
-				break
-			}
-		}
+		podReady := podIsReady(pod)
 
 		// If the pod appears ready, also verify the workload rollout has completed.
 		// The old pod may still be running (and ready) while the StatefulSet is rolling
@@ -953,6 +950,64 @@ func (r *ValkeyNodeReconciler) getPod(ctx context.Context, node *valkeyiov1alpha
 		return &podList.Items[0], nil
 	}
 	return nil, nil
+}
+
+// podIsReady reports whether the pod's Ready condition is true.
+func podIsReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// podSupersededAndStuck reports whether a pod can no longer be replaced by its
+// own StatefulSet, so the operator has to delete it for the rollout to finish.
+//
+// Node StatefulSets use OrderedReady pod management, and under that policy the
+// StatefulSet controller performs no update work until the existing pod is
+// Running and Ready. A pod that never becomes Ready is therefore the one thing
+// blocking its own replacement: correcting the spec updates the template and
+// the revision, and the pod stays on the superseded one indefinitely.
+//
+// Both halves of the check matter. A pod crash-looping on the revision the
+// StatefulSet still wants is left alone, because recreating it yields the same
+// pod and the same crash, which would turn a visible configuration error into
+// an endless restart loop.
+func podSupersededAndStuck(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	if pod == nil || sts == nil || pod.DeletionTimestamp != nil {
+		return false
+	}
+	// Before the StatefulSet controller has observed the template there is no
+	// revision to be superseded by.
+	if sts.Status.UpdateRevision == "" {
+		return false
+	}
+	if pod.Labels[appsv1.StatefulSetRevisionLabel] == sts.Status.UpdateRevision {
+		return false
+	}
+	return !podIsReady(pod)
+}
+
+// replaceSupersededPod deletes the node's pod when its StatefulSet cannot do it.
+func (r *ValkeyNodeReconciler) replaceSupersededPod(ctx context.Context, node *valkeyiov1alpha1.ValkeyNode, sts *appsv1.StatefulSet) error {
+	pod, err := r.getPod(ctx, node)
+	if err != nil || pod == nil {
+		return err
+	}
+	if !podSupersededAndStuck(pod, sts) {
+		return nil
+	}
+	podRevision := pod.Labels[appsv1.StatefulSetRevisionLabel]
+	if err := r.Delete(ctx, pod); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	logf.FromContext(ctx).Info("deleted a pod its StatefulSet could not replace",
+		"pod", pod.Name, "podRevision", podRevision, "updateRevision", sts.Status.UpdateRevision)
+	r.Recorder.Eventf(node, nil, corev1.EventTypeNormal, "SupersededPodDeleted", "ReplaceSupersededPod",
+		"Deleted pod %s: not ready and left on superseded revision %s", pod.Name, podRevision)
+	return nil
 }
 
 // buildNodeClientOption builds the valkey-go client option for connecting to a
